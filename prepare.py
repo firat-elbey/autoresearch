@@ -24,25 +24,67 @@ import tiktoken
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Device detection
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+def detect_device():
+    """Best available device: cuda > mps > cpu. Override with AUTORESEARCH_DEVICE."""
+    if os.environ.get("AUTORESEARCH_DEVICE"):
+        return os.environ["AUTORESEARCH_DEVICE"]
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+DEVICE = detect_device()
+SMALL = DEVICE != "cuda"  # small-platform mode: laptop-scale defaults
+
+def _env_int(name, default):
+    return int(os.environ.get(name, default))
+
+# ---------------------------------------------------------------------------
+# Constants (fixed for a given run; small-platform defaults on non-CUDA,
+# overridable via AUTORESEARCH_* env vars)
+# ---------------------------------------------------------------------------
+
+MAX_SEQ_LEN = _env_int("AUTORESEARCH_MAX_SEQ_LEN", 256 if SMALL else 2048)  # context length
+TIME_BUDGET = _env_int("AUTORESEARCH_TIME_BUDGET", 300)  # training time budget in seconds (5 minutes)
+EVAL_TOKENS = _env_int("AUTORESEARCH_EVAL_TOKENS", 2**17 if SMALL else 40 * 524288)  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
+
+# Dataset: climbmix (default on CUDA, the upstream setup) or tinystories
+# (default on small platforms — much lower entropy, so tiny models produce
+# reasonable results; see the README's small-platform notes).
+DATASET = os.environ.get("AUTORESEARCH_DATASET", "tinystories" if SMALL else "climbmix")
+assert DATASET in ("climbmix", "tinystories"), f"Unknown dataset: {DATASET}"
+
+# climbmix keeps the original cache paths so existing setups are untouched;
+# other datasets get their own data + tokenizer dirs (tokenizer is data-dependent).
+_suffix = "" if DATASET == "climbmix" else f"-{DATASET}"
+DATA_DIR = os.path.join(CACHE_DIR, "data" + _suffix)
+TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer" + _suffix)
+
+CLIMBMIX_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+TINYSTORIES_REPO = "karpathy/tinystories-gpt4-clean"
+MAX_SHARD = 6542 # the last climbmix datashard is shard_06542.parquet
 VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+VOCAB_SIZE = _env_int("AUTORESEARCH_VOCAB_SIZE", 4096 if SMALL else 8192)
+
+def get_val_filename():
+    """Filename of the pinned validation shard.
+    climbmix: the fixed last shard. Other datasets: the lexicographically last
+    downloaded parquet file (prepare.py always downloads the last repo file)."""
+    if DATASET == "climbmix":
+        return f"shard_{VAL_SHARD:05d}.parquet"
+    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet"))
+    assert files, f"No parquet files in {DATA_DIR}. Run prepare.py first."
+    return files[-1]
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -54,14 +96,13 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
+def download_file(task):
+    """Download one file (url, filepath) with retries. Returns True on success."""
+    url, filepath = task
+    filename = os.path.basename(filepath)
     if os.path.exists(filepath):
         return True
 
-    url = f"{BASE_URL}/{filename}"
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
@@ -88,29 +129,55 @@ def download_single_shard(index):
     return False
 
 
+def _run_downloads(tasks, download_workers):
+    """Download a list of (url, filepath) tasks in parallel."""
+    existing = sum(1 for _, path in tasks if os.path.exists(path))
+    if existing == len(tasks):
+        print(f"Data: all {len(tasks)} shards already downloaded at {DATA_DIR}")
+        return
+
+    needed = len(tasks) - existing
+    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+
+    workers = max(1, min(download_workers, needed))
+    with Pool(processes=workers) as pool:
+        results = pool.map(download_file, tasks)
+
+    ok = sum(1 for r in results if r)
+    print(f"Data: {ok}/{len(tasks)} shards ready at {DATA_DIR}")
+
+
 def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+    """Download training shards + pinned validation shard (climbmix)."""
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
     ids = list(range(num_train))
     if VAL_SHARD not in ids:
         ids.append(VAL_SHARD)
+    tasks = [(f"{CLIMBMIX_URL}/shard_{i:05d}.parquet",
+              os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")) for i in ids]
+    _run_downloads(tasks, download_workers)
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+def download_tinystories(num_shards, download_workers=8):
+    """Download TinyStories shards. The repo's file layout is discovered at
+    runtime via the HuggingFace API (first N files as train, last file as val)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    api_url = f"https://huggingface.co/api/datasets/{TINYSTORIES_REPO}/tree/main?recursive=true"
+    response = requests.get(api_url, timeout=30)
+    response.raise_for_status()
+    remote_paths = sorted(item["path"] for item in response.json()
+                          if item.get("type") == "file" and item["path"].endswith(".parquet"))
+    if len(remote_paths) < 2:
+        print(f"Error: expected >=2 parquet files in {TINYSTORIES_REPO}, found {len(remote_paths)}. "
+              f"Use AUTORESEARCH_DATASET=climbmix instead.")
+        sys.exit(1)
+    # First N files are train shards, last file is pinned as the val shard
+    # (get_val_filename() picks the lexicographically last local file).
+    selected = remote_paths[:min(num_shards, len(remote_paths) - 1)] + [remote_paths[-1]]
+    tasks = [(f"https://huggingface.co/datasets/{TINYSTORIES_REPO}/resolve/main/{p}",
+              os.path.join(DATA_DIR, p.replace("/", "_"))) for p in selected]
+    _run_downloads(tasks, download_workers)
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -124,7 +191,7 @@ def list_parquet_files():
 
 def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
     """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
+    parquet_paths = [p for p in list_parquet_files() if not p.endswith(get_val_filename())]
     nchars = 0
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)
@@ -255,7 +322,7 @@ def _document_batches(split, tokenizer_batch_size=128):
     """Infinite iterator over document batches from parquet files."""
     parquet_paths = list_parquet_files()
     assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    val_path = os.path.join(DATA_DIR, get_val_filename())
     if split == "train":
         parquet_paths = [p for p in parquet_paths if p != val_path]
         assert len(parquet_paths) > 0, "No training shards found."
@@ -294,13 +361,14 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         doc_buffer.extend(token_lists)
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
+    # (pinned memory + async H2D copy on CUDA; plain copies elsewhere)
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(DEVICE == "cuda"))
+    device_buffer = torch.empty(2 * B * T, dtype=torch.long, device=DEVICE) if DEVICE != "cpu" else cpu_buffer
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    inputs = device_buffer[:B * T].view(B, T)
+    targets = device_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -333,7 +401,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if DEVICE != "cpu":
+            device_buffer.copy_(cpu_buffer, non_blocking=(DEVICE == "cuda"))
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -349,7 +418,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device=DEVICE)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
@@ -377,10 +446,14 @@ if __name__ == "__main__":
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"Device: {DEVICE} | dataset: {DATASET} | vocab_size: {VOCAB_SIZE} | max_seq_len: {MAX_SEQ_LEN}")
     print()
 
     # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    if DATASET == "tinystories":
+        download_tinystories(num_shards, download_workers=args.download_workers)
+    else:
+        download_data(num_shards, download_workers=args.download_workers)
     print()
 
     # Step 2: Train tokenizer

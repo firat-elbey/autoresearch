@@ -49,6 +49,51 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
+## Local quickstart (CPU / Apple Silicon / no H100 required)
+
+This fork runs on machines without an NVIDIA GPU. The device is auto-detected
+(`cuda` > `mps` > `cpu`), and on non-CUDA platforms the code automatically
+switches to laptop-scale defaults following the small-platform guidance below:
+the low-entropy [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean),
+`vocab_size` 4096, `MAX_SEQ_LEN` 256, a depth-4 model, full ("L") attention via
+PyTorch SDPA instead of FlashAttention-3, and `torch.compile` off. On a CUDA
+machine everything behaves exactly like upstream.
+
+```bash
+git clone https://github.com/firat-elbey/autoresearch && cd autoresearch
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
+uv sync                                            # re-locks for your platform on first run
+uv run prepare.py --num-shards 2                   # download TinyStories + train tokenizer
+AUTORESEARCH_TIME_BUDGET=60 uv run train.py        # 1-minute smoke test
+uv run train.py                                    # real 5-minute run
+```
+
+Defaults can be overridden with env vars (set them for *both* `prepare.py` and
+`train.py` so they agree): `AUTORESEARCH_DEVICE` (cuda/mps/cpu),
+`AUTORESEARCH_DATASET` (tinystories/climbmix), `AUTORESEARCH_VOCAB_SIZE`,
+`AUTORESEARCH_MAX_SEQ_LEN`, `AUTORESEARCH_EVAL_TOKENS`,
+`AUTORESEARCH_TIME_BUDGET`, `AUTORESEARCH_COMPILE` (1/0). Each dataset gets its
+own cache under `~/.cache/autoresearch/`; if you change `VOCAB_SIZE`, delete the
+matching `tokenizer*` dir there and re-run `prepare.py`. Notes: on Apple Silicon
+the MPS path uses bfloat16, which wants an M2 or newer (on an M1 set
+`AUTORESEARCH_DEVICE=cpu`); on Windows the PyPI torch wheel is CPU-only.
+
+### Headless runs with `claude -p`
+
+Instead of babysitting an interactive session, `autoloop.sh` drives the
+experiment loop with the claude CLI in non-interactive mode — one fresh
+`claude -p` invocation per experiment, with state carried in git history and
+`results.tsv`:
+
+```bash
+./autoloop.sh 3                        # 3 experiments with haiku (cheap test)
+CLAUDE_MODEL=sonnet ./autoloop.sh 50   # overnight run with a stronger model
+```
+
+It creates the `autoresearch/<tag>` branch and `results.tsv` for you. Note it
+runs claude with `--dangerously-skip-permissions`, so use a checkout you're
+happy to let an agent loose on.
+
 ## Project structure
 
 ```
