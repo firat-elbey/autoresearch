@@ -78,6 +78,21 @@ matching `tokenizer*` dir there and re-run `prepare.py`. Notes: on Apple Silicon
 the MPS path uses bfloat16, which wants an M2 or newer (on an M1 set
 `AUTORESEARCH_DEVICE=cpu`); on Windows the PyPI torch wheel is CPU-only.
 
+### NixOS
+
+Prebuilt wheels don't run on NixOS without help (no `/lib64` linker), so use
+the provided FHS shell — or skip it if you already have `nix-ld` enabled:
+
+```bash
+nix-shell          # provides uv + libs the wheels need, then quickstart as above
+```
+
+Note for CPU-only Linux boxes (Nix or otherwise): the lockfile resolves torch
+from the CUDA index on Linux, which works fine on CPU but downloads a few GB of
+CUDA libs. If that bothers you, point the `pytorch-cu128` index in
+`pyproject.toml` at `https://download.pytorch.org/whl/cpu` instead and
+`uv sync` again.
+
 ### Headless runs with `claude -p`
 
 Instead of babysitting an interactive session, `autoloop.sh` drives the
